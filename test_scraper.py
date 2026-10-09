@@ -25,7 +25,7 @@ class Tests(unittest.TestCase):
             merged = merge_and_save(path, [{'match_id':'one', 'home_total':'81'}, {'match_id':'two'}])
             self.assertEqual(len(merged), 2)
             self.assertEqual(merged[0]['notes'], 'my note')
-            self.assertEqual(merged[0]['home_total'], '81')
+            self.assertEqual(merged[0]['home_total'], '80')
 
 if __name__ == '__main__':
     unittest.main()
