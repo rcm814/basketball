@@ -114,12 +114,12 @@ def result_date(value: str, today: date) -> date | None:
         return None
 
 
-def scrape(config: dict[str, Any]) -> list[dict[str, Any]]:
+def scrape(config: dict[str, Any], known_ids: set[str] | None = None) -> list[dict[str, Any]]:
     if sync_playwright is None:
         raise SystemExit("Playwright is not installed. Run: py -m pip install -r requirements.txt")
     today = datetime.now(ZoneInfo(config.get("timezone", "Europe/Budapest"))).date()
-    start = today - timedelta(days=int(config.get("lookback_days", 3)))
-    print(f"Date window: {start} through {today - timedelta(days=1)}")
+    known_ids = known_ids or set()
+    print("Loading result history; processing oldest first, adding unseen match IDs")
     results: list[dict[str, Any]] = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=bool(config.get("headless", True)))
@@ -136,24 +136,34 @@ def scrape(config: dict[str, Any]) -> list[dict[str, Any]]:
             if consent.count() and consent.is_visible():
                 consent.click()
 
-            for _ in range(int(config.get("max_show_more_clicks", 3))):
+            for _ in range(int(config.get("max_show_more_clicks", 100))):
                 more = page.get_by_text(re.compile(r"show more matches", re.I)).first
                 if more.count() == 0 or not more.is_visible():
                     break
+                before = page.locator(".event__match").count()
                 more.click()
-                page.wait_for_timeout(1000)
+                page.wait_for_function("n => document.querySelectorAll('.event__match').length > n", arg=before, timeout=20000)
+            more = page.get_by_text(re.compile(r"show more matches", re.I)).first
+            if more.count() and more.is_visible():
+                raise RuntimeError("History loading limit reached; increase max_show_more_clicks. CSV left unchanged.")
 
             context = page_context(page, url)
             rows = page.locator(".event__match")
             print(f"  Found {rows.count()} game rows")
             collected_before = len(results)
-            for i in range(rows.count()):
-                item = parse_row(rows.nth(i), url, context)
+            for i in range(rows.count() - 1, -1, -1):
+                row = rows.nth(i)
+                match_id = clean_match_id(row.get_attribute("id") or "")
+                if not match_id:
+                    raise RuntimeError("Missing match ID; CSV left unchanged.")
+                if match_id in known_ids:
+                    continue
+                item = parse_row(row, url, context)
                 if item:
                     played = result_date(item["date_time"], today)
                     if played is None:
                         raise RuntimeError(f"Unrecognized game date: {item['date_time']!r}; CSV left unchanged.")
-                    if start <= played < today:
+                    if played <= today:
                         scores = [item[f"{side}_q{q}"] for side in ("home", "away") for q in range(1, 5)]
                         if not all(re.fullmatch(r"\d+", str(v)) for v in scores):
                             raise RuntimeError(f"Missing quarter scores for {item['match_id']}; CSV left unchanged.")
@@ -165,10 +175,11 @@ def scrape(config: dict[str, Any]) -> list[dict[str, Any]]:
                             item[f"{side}_ot"] = int(total - regulation)
                         item["game_date"] = played.isoformat()
                         results.append(item)
-            print(f"  Collected {len(results) - collected_before} games in date window")
+                        known_ids.add(item["match_id"])
+            print(f"  Collected {len(results) - collected_before} new games")
             time.sleep(float(config.get("request_delay_seconds", 1.5)))
         browser.close()
-    return results
+    return sorted(results, key=lambda r: (r.get("game_date", ""), r.get("date_time", ""), r["match_id"]))
 
 
 def read_existing_csv(path: Path) -> dict[str, dict[str, str]]:
@@ -181,6 +192,8 @@ def read_existing_csv(path: Path) -> dict[str, dict[str, str]]:
 def merge_and_save(path: Path, fresh: list[dict[str, Any]]) -> list[dict[str, Any]]:
     old = read_existing_csv(path)
     for row in fresh:
+        if row["match_id"] in old:
+            continue
         prior = old.get(row["match_id"], {})
         # User-editable fields survive future scrapes.
         row["notes"] = prior.get("notes", "")
@@ -297,7 +310,7 @@ def main() -> None:
     out = (config_path.parent / config.get("output_directory", "data")).resolve()
     out.mkdir(parents=True, exist_ok=True)
     csv_path, xlsx_path = out / "games.csv", out / "basketball_data.xlsx"
-    fresh = [] if args.rebuild_only else scrape(config)
+    fresh = [] if args.rebuild_only else scrape(config, set(read_existing_csv(csv_path)))
     rows = merge_and_save(csv_path, fresh)
     for filename, table in (("team_stats.csv", team_stats(rows)), ("league_stats.csv", combined_stats(rows))):
         with (out / filename).open("w", newline="", encoding="utf-8-sig") as fh:
