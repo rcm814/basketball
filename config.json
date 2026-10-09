@@ -1,0 +1,11 @@
+{
+  "league_urls": [
+    "https://www.flashscore.com/basketball/europe/euroleague/results/"
+  ],
+  "headless": true,
+  "max_show_more_clicks": 3,
+  "request_delay_seconds": 1.5,
+  "output_directory": "data",
+  "lookback_days": 3,
+  "timezone": "Europe/Budapest"
+}
