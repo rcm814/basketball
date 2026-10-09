@@ -66,10 +66,10 @@ def page_context(page, url: str) -> tuple[str, str, str]:
 
 def parse_row(row, url: str, context: tuple[str, str, str]) -> dict[str, Any] | None:
     country, league, season = context
-    home = text_or_blank(row, ".event__participant--home")
-    away = text_or_blank(row, ".event__participant--away")
+    home = text_or_blank(row, ".event__homeParticipant, .event__participant--home")
+    away = text_or_blank(row, ".event__awayParticipant, .event__participant--away")
     if not home or not away:
-        return None
+        raise RuntimeError("Could not read game teams; Flashscore markup changed. CSV left unchanged.")
 
     values: dict[str, Any] = {
         "match_id": clean_match_id(row.get_attribute("id") or ""),
@@ -78,7 +78,7 @@ def parse_row(row, url: str, context: tuple[str, str, str]) -> dict[str, Any] | 
         "country": country,
         "league": league,
         "season": season,
-        "date_time": text_or_blank(row, ".event__time"),
+        "date_time": text_or_blank(row, ".event__stageTime--date, .event__time"),
         "status": text_or_blank(row, ".event__stage--block") or "Finished",
         "home_team": home,
         "away_team": away,
@@ -132,6 +132,10 @@ def scrape(config: dict[str, Any]) -> list[dict[str, Any]]:
             except PlaywrightTimeoutError:
                 raise RuntimeError(f"No match rows found for {url}; CSV left unchanged.")
 
+            consent = page.locator("#onetrust-reject-all-handler")
+            if consent.count() and consent.is_visible():
+                consent.click()
+
             for _ in range(int(config.get("max_show_more_clicks", 3))):
                 more = page.get_by_text(re.compile(r"show more matches", re.I)).first
                 if more.count() == 0 or not more.is_visible():
@@ -141,6 +145,8 @@ def scrape(config: dict[str, Any]) -> list[dict[str, Any]]:
 
             context = page_context(page, url)
             rows = page.locator(".event__match")
+            print(f"  Found {rows.count()} game rows")
+            collected_before = len(results)
             for i in range(rows.count()):
                 item = parse_row(rows.nth(i), url, context)
                 if item:
@@ -159,6 +165,7 @@ def scrape(config: dict[str, Any]) -> list[dict[str, Any]]:
                             item[f"{side}_ot"] = int(total - regulation)
                         item["game_date"] = played.isoformat()
                         results.append(item)
+            print(f"  Collected {len(results) - collected_before} games in date window")
             time.sleep(float(config.get("request_delay_seconds", 1.5)))
         browser.close()
     return results
