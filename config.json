@@ -6,6 +6,6 @@
   "max_show_more_clicks": 3,
   "request_delay_seconds": 1.5,
   "output_directory": "data",
-  "lookback_days": 3,
+  "lookback_days": 15,
   "timezone": "Europe/Budapest"
 }
