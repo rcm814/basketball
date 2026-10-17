@@ -11,6 +11,7 @@ from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
@@ -24,6 +25,60 @@ except ImportError:  # Lets --help / analytics code fail with a useful setup mes
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+def results_url(value: str) -> str:
+    parsed = urlparse(value)
+    parts = parsed.path.strip("/").split("/")
+    if parsed.scheme != "https" or parsed.hostname not in ("www.flashscore.com", "flashscore.com"):
+        raise ValueError("Use an https://www.flashscore.com basketball league URL.")
+    if len(parts) not in (3, 4) or parts[0] != "basketball":
+        raise ValueError("Expected /basketball/country/league/ or its results page.")
+    if len(parts) == 4 and parts[3] not in ("results", "fixtures", "standings", "archive"):
+        raise ValueError("Expected a basketball league page.")
+    return "https://www.flashscore.com/" + "/".join(parts[:3]) + "/results/"
+
+
+def search_leagues(query: str, config: dict[str, Any], country: str | None = None) -> list[tuple[str, str]]:
+    """Search league links on Flashscore's basketball country directories."""
+    if sync_playwright is None:
+        raise SystemExit("Install requirements and Playwright Chromium first.")
+    matches = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=bool(config.get("headless", True)))
+        page = browser.new_page()
+        page.goto("https://www.flashscore.com/basketball/", wait_until="networkidle", timeout=60000)
+        consent = page.locator("#onetrust-reject-all-handler")
+        if consent.count() and consent.is_visible():
+            consent.click()
+        links = page.locator("a[href]").evaluate_all(
+            "els => els.map(a => ({url:a.href, name:a.textContent.trim()}))")
+        countries = sorted({a["url"] for a in links
+                            if re.fullmatch(r"https://www\.flashscore\.com/basketball/[^/]+/", a["url"])})
+        if country:
+            slug = country.strip().lower().replace(" ", "-")
+            if not re.fullmatch(r"[a-z-]+", slug):
+                raise ValueError("Country must be a name such as australia or czech-republic.")
+            countries = ["https://www.flashscore.com/basketball/" + slug + "/"]
+        if not countries:
+            raise RuntimeError("No country links found. Use --country or --league-url.")
+        for url in countries:
+            print("Searching", url, flush=True)
+            page.goto(url, wait_until="networkidle", timeout=60000)
+            links = page.locator("a[href]").evaluate_all(
+                "els => els.map(a => ({url:a.href, name:a.textContent.trim()}))")
+            for link in links:
+                if query.casefold() not in link["name"].casefold():
+                    continue
+                try:
+                    normalized = results_url(link["url"])
+                except ValueError:
+                    continue
+                matches[normalized] = link["name"]
+            time.sleep(float(config.get("request_delay_seconds", 1.5)))
+        browser.close()
+    return sorted((name, url) for url, name in matches.items())
+
 RAW_FIELDS = [
     "match_id", "scraped_at_utc", "league_url", "country", "league", "season",
     "date_time", "game_date", "status", "home_team", "away_team", "home_total", "away_total",
@@ -186,23 +241,38 @@ def read_existing_csv(path: Path) -> dict[str, dict[str, str]]:
     if not path.exists():
         return {}
     with path.open("r", newline="", encoding="utf-8-sig") as fh:
-        return {r["match_id"]: r for r in csv.DictReader(fh) if r.get("match_id")}
+        reader = csv.DictReader(fh)
+        if not reader.fieldnames or "match_id" not in reader.fieldnames:
+            raise ValueError(f"{path} must contain a match_id column; file left unchanged.")
+        rows = list(reader)
+        if any(not r.get("match_id") for r in rows):
+            raise ValueError(f"{path} contains a row without match_id; file left unchanged.")
+        ids = [r["match_id"] for r in rows]
+        if len(ids) != len(set(ids)):
+            raise ValueError(f"{path} contains duplicate match IDs; file left unchanged.")
+        return {r["match_id"]: r for r in rows}
 
 
 def merge_and_save(path: Path, fresh: list[dict[str, Any]]) -> list[dict[str, Any]]:
     old = read_existing_csv(path)
+    fields = list(RAW_FIELDS)
+    for existing in old.values():
+        fields.extend(k for k in existing if k not in fields)
+    added = False
     for row in fresh:
+        if not row.get("match_id"):
+            raise ValueError("Cannot save a game without a match_id.")
         if row["match_id"] in old:
             continue
-        prior = old.get(row["match_id"], {})
-        # User-editable fields survive future scrapes.
-        row["notes"] = prior.get("notes", "")
-        row["tags"] = prior.get("tags", "")
         old[row["match_id"]] = {k: row.get(k, "") for k in RAW_FIELDS}
+        added = True
     rows = list(old.values())
+    if path.exists() and not added:
+        return rows
+    path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(".csv.tmp")
     with temp.open("w", newline="", encoding="utf-8-sig") as fh:
-        writer = csv.DictWriter(fh, fieldnames=RAW_FIELDS)
+        writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
     temp.replace(path)
@@ -303,13 +373,28 @@ def export_xlsx(path: Path, rows: list[dict[str, Any]], config: dict[str, Any]) 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Scrape Flashscore basketball results and calculate quarter stats.")
     parser.add_argument("--config", default=str(ROOT / "config.json"))
+    parser.add_argument("--search", help="Find basketball leagues by name; does not scrape or change files.")
+    parser.add_argument("--country", help="Limit league search to a country, e.g. australia.")
+    parser.add_argument("--league-url", action="append", help="Scrape this league instead of configured leagues; repeatable.")
+    parser.add_argument("--csv", help="Create or update this CSV instead of data/games.csv.")
     parser.add_argument("--rebuild-only", action="store_true", help="Rebuild the workbook from existing CSV without scraping.")
     args = parser.parse_args()
     config_path = Path(args.config).resolve()
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    if args.search:
+        matches = search_leagues(args.search, config, args.country)
+        for name, url in matches:
+            print(f"{name}: {url}")
+        if not matches:
+            print("No matching leagues found. Try --country or supply --league-url directly.")
+        return
+    config["league_urls"] = list(dict.fromkeys(results_url(u) for u in (args.league_url or config["league_urls"])))
     out = (config_path.parent / config.get("output_directory", "data")).resolve()
     out.mkdir(parents=True, exist_ok=True)
     csv_path, xlsx_path = out / "games.csv", out / "basketball_data.xlsx"
+    if args.csv:
+        csv_path = Path(args.csv).resolve()
+    before = len(read_existing_csv(csv_path))
     fresh = [] if args.rebuild_only else scrape(config, set(read_existing_csv(csv_path)))
     rows = merge_and_save(csv_path, fresh)
     for filename, table in (("team_stats.csv", team_stats(rows)), ("league_stats.csv", combined_stats(rows))):
@@ -317,6 +402,7 @@ def main() -> None:
             csv.writer(fh).writerows(table)
     export_xlsx(xlsx_path, rows, config)
     print(f"Saved {len(rows)} unique games to {csv_path}")
+    print(f"Added {len(rows) - before} new games; existing games unchanged.")
     print(f"Workbook: {xlsx_path}")
 
 
